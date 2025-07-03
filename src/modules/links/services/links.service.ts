@@ -1,66 +1,73 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { LinkEntity } from '../entities/link.entity';
-import { Repository } from 'typeorm';
+import { IsNull, MoreThan, Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
-import { CreateLinkDto } from '../dto/create-link.dto';
-import { ConfigService } from '@nestjs/config';
+
+import { NotFoundLinkException } from 'src/common/exceptions/NotFoundLink.exception';
+import { LinkExpiredException } from 'src/common/exceptions/LinkExpired.exception';
+
+import { Cache, CACHE_MANAGER } from '@nestjs/cache-manager';
+import { Cached } from 'src/common/decorators/cached.decorator';
+
+
+interface ILinkService {
+  findByCodeLink(codeOrAlias: string): Promise<LinkEntity>;
+  getLinks(): Promise<LinkEntity[]>
+}
+
 
 @Injectable()
-export class LinkService {
+export class LinkService implements ILinkService {
   constructor(
+    @Inject(CACHE_MANAGER) private cacheManager: Cache,
     @InjectRepository(LinkEntity)
     private readonly linkRepo: Repository<LinkEntity>,
-    private configService: ConfigService
+  
   ) {}
 
 
-
-  async createShortLink(dto: CreateLinkDto): Promise<string> {
-    const { originalUrl, alias, ttl } = dto;
-
-    // Проверка alias
-    if (alias) {
-      const exists = await this.linkRepo.findOne({ where: { alias } });
-      if (exists) {
-        throw new ConflictException('Alias already in use');
-      }
-    }
-
-    // Генерация уникального кода
-    const code = alias ?? this.generateUniqueCode();
-
-    const expiresAt = ttl
-      ? new Date(Date.now() + ttl * 60 * 60 * 1000)
-      : null;
-
-    const entity = this.linkRepo.create({
-      originalUrl,
-      alias: alias ?? null,
-      code,
-      expiresAt,
+  public async findByCodeLink(codeOrAlias: string): Promise<LinkEntity> {
+    const link = await this.linkRepo.findOne({
+      where: [{ code: codeOrAlias }, { alias: codeOrAlias }],
     });
+    
 
-    await this.linkRepo.save(entity);
-
-    const originUrl = this.configService.get<string>('HOST');
-    if (originUrl) {
-      return `${originUrl}/${code}`;
-    }
-
-    return `http://localhost:8000/${code}`;
-  }
-
-  private generateUniqueCode(length = 7): string {
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    return Array.from({ length }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-  }
-
-  public async getLink(code: string): Promise<LinkEntity> {
-    const link = await this.linkRepo.findOne({ where: { code } });
     if (!link) {
-      throw new ConflictException('Link not found');
+      throw new NotFoundLinkException(codeOrAlias);
     }
+
+    if (link.expiresAt && link.expiresAt.getTime() < Date.now()) {
+      throw new LinkExpiredException(codeOrAlias);
+    }
+
     return link;
   }
+
+  
+  public async getLinks(): Promise<LinkEntity[]> {
+    const cacheKey = 'getLinks';
+    const cached: LinkEntity[] | undefined = await this.cacheManager.get(cacheKey);
+    if (cached) {
+      console.log('🔁 Данные из Redis');
+      return cached;
+    }
+
+    const links = await this.linkRepo.find({
+      where: [{ expiresAt: IsNull() }, { expiresAt: MoreThan(new Date()) }],
+      order: { createdAt: 'DESC' },
+    });
+
+    if (links.length === 0) {
+      throw new NotFoundLinkException("Нету ссылок в сервисе");
+    }
+
+    await this.cacheManager.set(cacheKey, JSON.stringify(links), 60);
+    console.log('✅ Кэш установлен:', await this.cacheManager.get(cacheKey));
+
+
+    return links;
+  }
+
+
 }
 
